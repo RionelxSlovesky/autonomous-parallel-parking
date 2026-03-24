@@ -42,8 +42,8 @@ ParkedCarLength = 0.36;
 ParkedCarWidth  = 0.20;
 
 % Slot geometry
-SlotLength = 0.72;
-SlotDepth  = 0.30;
+SlotLength = 0.90;   
+SlotDepth  = 0.36;
 
 % World
 Geofence = [-1.5 1.5 -0.8 1.0];
@@ -68,8 +68,8 @@ GoalSpeedTol = 0.05;
 %% =========================
 % Initial pose
 % =========================
-x = 0.60;
-y = 0.20;
+x = 0.06;
+y = 0.2;
 psi = 0.00;
 v = 0.0;
 delta = 0.0;
@@ -78,10 +78,10 @@ delta = 0.0;
 % Hand-scripted phase plan
 % =========================
 % You can tune these 6 numbers first before changing anything else.
-N1 = 140;   % forward approach duration
-N2 = 240;   % reverse turn-in duration
-N3 = 220;   % reverse straighten duration
-N4 =  80;   % stop/settle duration
+N1 = 360;   % forward approach duration
+N2 = 320;   % reverse turn-in duration
+N3 = 400;   % reverse straighten duration
+N4 =  200;   % stop/settle duration
 
 steer1 =  0.00;  vref1 =  0.12;   % forward straight
 steer2 = -0.48;  vref2 = -0.10;   % reverse into slot

@@ -1,30 +1,25 @@
-% run_hand_scripted_parallelpark_validation.m
+% run_state_based_parallelpark_baseline.m
 clear; clc; close all;
 
 %% =========================
-% Hand-Scripted Parallel Parking Validation
+% State-Based Scripted Parallel Parking Baseline
 % =========================
-% Goal:
-%   Verify that the parking geometry is physically feasible using a
-%   manually scripted maneuver with fixed control phases.
+% Key update in this version:
+%   - Adds an EARLY STOP GATE so the car stops once it is "good enough"
+%     instead of continuing to over-park.
 %
-% Phases:
-%   1) Forward straight approach
-%   2) Reverse turn-in
-%   3) Reverse straighten
-%   4) Stop
-%
-% This script uses:
-%   - kinematic bicycle model
-%   - steering lag
-%   - simple collision checks
-%   - visualization + animation
+% Phase sequence:
+%   1) forward_approach
+%   2) reverse_turn_in
+%   3) reverse_straighten
+%   4) reverse_heading_correction
+%   5) stop
 
 %% =========================
 % Parameters
 % =========================
 Ts = 0.02;
-MaxSteps = 5000;
+MaxSteps = 12000;
 
 % Vehicle model
 Wheelbase = 0.256;
@@ -42,7 +37,7 @@ ParkedCarLength = 0.36;
 ParkedCarWidth  = 0.20;
 
 % Slot geometry
-SlotLength = 0.90;   
+SlotLength = 0.90;
 SlotDepth  = 0.36;
 
 % World
@@ -60,35 +55,44 @@ carHalf = ParkedCarLength / 2;
 FrontCarCenter = [ gapHalf + carHalf, TargetY];
 RearCarCenter  = [-gapHalf - carHalf, TargetY];
 
-% Success tolerances
-GoalRadius = 0.08;
-GoalYawTol = deg2rad(10);
-GoalSpeedTol = 0.05;
+% Strict success tolerances
+GoalRadius = 0.10;
+GoalYawTol = deg2rad(25);
+GoalSpeedTol = 0.06;
+
+% Early stop gate (so it stops before over-parking)
+softStopPosTol = 0.2;
+softStopYawTol = deg2rad(20);
 
 %% =========================
 % Initial pose
 % =========================
 x = 0.06;
-y = 0.2;
+y = 0.20;
 psi = 0.00;
 v = 0.0;
 delta = 0.0;
 
 %% =========================
-% Hand-scripted phase plan
+% Phase parameters
 % =========================
-% You can tune these 6 numbers first before changing anything else.
-N1 = 380;   % forward approach duration
-N2 = 350;   % reverse turn-in duration
-N3 = 400;   % reverse straighten duration
-N4 =  80;   % stop/settle duration
+entryX = 0.7;                  % forward until x reaches this
+reverseTurnYawTarget = -0.55;   % switch from turn-in to straighten
+headingCorrectionTol = deg2rad(1.5);
 
-steer1 =  0.00;  vref1 =  0.12;   % forward straight
-steer2 = -0.48;  vref2 = -0.10;   % reverse into slot
-steer3 =  0.46;  vref3 = -0.08;   % reverse straighten
-steer4 =  0.00;  vref4 =  0.00;   % stop
+% Commands by phase
+steer_approach   =  0.00;  vref_approach  =  0.12;
+steer_turnin     = -0.30;  vref_turnin    = -0.12;
+steer_straight   =  0.90;  vref_straight  = -0.08;
 
-phaseBreaks = [N1, N1+N2, N1+N2+N3, N1+N2+N3+N4];
+% Small final correction commands
+steer_correct_l  = -0.12;
+steer_correct_r  =  0.18;
+vref_correct     = -0.02;
+
+steer_stop       =  0.00;  vref_stop      =  0.00;
+
+phase = "forward_approach";
 
 %% =========================
 % Logging
@@ -111,61 +115,115 @@ outOfBounds = false;
 % =========================
 for k = 1:MaxSteps
 
-    % ----- phase selection -----
-    if k <= phaseBreaks(1)
-        steerCmd = steer1;
-        vRef = vref1;
-        phaseName = "forward_approach";
-    elseif k <= phaseBreaks(2)
-        steerCmd = steer2;
-        vRef = vref2;
-        phaseName = "reverse_turn_in";
-    elseif k <= phaseBreaks(3)
-        steerCmd = steer3;
-        vRef = vref3;
-        phaseName = "reverse_straighten";
-    elseif k <= phaseBreaks(4)
-        steerCmd = steer4;
-        vRef = vref4;
-        phaseName = "stop";
-    else
-        steerCmd = 0.0;
-        vRef = 0.0;
-        phaseName = "done";
+    posErr = hypot(x - TargetX, y - TargetY);
+    yawErrSigned = wrapToPiLocal(TargetYaw - psi);
+    yawErr = abs(yawErrSigned);
+
+    % ----- Early stop gate -----
+    % Once the car is already in a decent parking pose, stop motion
+    % so it does not keep over-parking.
+    if posErr < softStopPosTol && yawErr < softStopYawTol
+        phase = "stop";
     end
 
-    % clamp steering
+    % ----- Phase transitions -----
+    switch phase
+        case "forward_approach"
+            if x >= entryX
+                phase = "reverse_turn_in";
+            end
+
+        case "reverse_turn_in"
+            if psi <= reverseTurnYawTarget || y <= (TargetY + 0.10)
+                phase = "reverse_straighten";
+            end
+
+        case "reverse_straighten"
+            if posErr < 0.12 && yawErr < deg2rad(15)
+                phase = "reverse_heading_correction";
+            end
+
+        case "reverse_heading_correction"
+            if posErr < GoalRadius && yawErr < GoalYawTol && abs(v) < 0.08
+                phase = "stop";
+            end
+
+        case "stop"
+            % stay here
+    end
+
+    % ----- Command generation by phase -----
+    switch phase
+        case "forward_approach"
+            steerCmd = steer_approach;
+            vRef = vref_approach;
+
+        case "reverse_turn_in"
+            steerCmd = steer_turnin;
+            vRef = vref_turnin;
+
+        case "reverse_straighten"
+            steerCmd = steer_straight;
+            vRef = vref_straight;
+
+        case "reverse_heading_correction"
+            % Small final touch-up based on heading error sign
+            if yawErrSigned > headingCorrectionTol
+                steerCmd = steer_correct_l;
+            elseif yawErrSigned < -headingCorrectionTol
+                steerCmd = steer_correct_r;
+            else
+                steerCmd = 0.0;
+            end
+            vRef = vref_correct;
+
+        case "stop"
+            steerCmd = steer_stop;
+            vRef = vref_stop;
+    end
+
+    % Clamp steering
     steerCmd = min(max(steerCmd, SteerMin), SteerMax);
 
-    % simple P speed controller
-    vCmd = 1.5 * (vRef - v);
+    % Speed controller
+    % Stronger braking once stop is triggered
+    if phase == "stop"
+        vCmd = 2.5 * (vRef - v);
+    else
+        vCmd = 1.5 * (vRef - v);
+    end
     vCmd = min(max(vCmd, -Vmax), Vmax);
 
-    % steering lag
+    % Steering lag
     delta = delta + (Ts/TauSteer) * (steerCmd - delta);
 
-    % speed smoothing
+    % Speed smoothing
     v = 0.85*v + 0.15*vCmd;
 
-    % kinematic bicycle update
+    % Kinematic bicycle update
     x = x + Ts * v * cos(psi);
     y = y + Ts * v * sin(psi);
     psi = wrapToPiLocal(psi + Ts * (v/Wheelbase) * tan(delta));
 
-    % checks
+    % Checks
     egoBox = getEgoAABB(x, y, EgoLength, EgoWidth);
     frontBox = getRectAABB(FrontCarCenter, ParkedCarLength, ParkedCarWidth);
     rearBox  = getRectAABB(RearCarCenter,  ParkedCarLength, ParkedCarWidth);
 
-    collision = aabbOverlap(egoBox, frontBox) || aabbOverlap(egoBox, rearBox) || (egoBox(3) < CurbY);
+    collision = aabbOverlap(egoBox, frontBox) || ...
+                aabbOverlap(egoBox, rearBox) || ...
+                (egoBox(3) < CurbY);
+
     outOfBounds = (x < Geofence(1)) || (x > Geofence(2)) || ...
                   (y < Geofence(3)) || (y > Geofence(4));
 
     posErr = hypot(x - TargetX, y - TargetY);
     yawErr = abs(wrapToPiLocal(TargetYaw - psi));
-    success = (posErr < GoalRadius) && (yawErr < GoalYawTol) && (abs(v) < GoalSpeedTol);
+    success = (posErr < GoalRadius) && ...
+              (yawErr < GoalYawTol) && ...
+              (abs(v) < GoalSpeedTol);
 
-    % log
+    % Log
     X(k) = x;
     Y(k) = y;
     PSI(k) = psi;
@@ -173,7 +231,7 @@ for k = 1:MaxSteps
     DELTA(k) = delta;
     STEER_CMD(k) = steerCmd;
     VREF(k) = vRef;
-    PHASE_NAME(k) = phaseName;
+    PHASE_NAME(k) = phase;
 
     if success || collision || outOfBounds
         X = X(1:k);
@@ -191,7 +249,7 @@ end
 %% =========================
 % Summary
 % =========================
-fprintf('\n==== Hand-Scripted Parking Validation Summary ====\n');
+fprintf('\n==== State-Based Scripted Parking Summary ====\n');
 fprintf('Steps: %d\n', length(X));
 fprintf('Success: %d\n', success);
 fprintf('Collision: %d\n', collision);
@@ -202,11 +260,12 @@ fprintf('Final yaw: %.4f rad\n', PSI(end));
 fprintf('Final speed: %.4f m/s\n', V(end));
 fprintf('Final pos err: %.4f\n', hypot(X(end)-TargetX, Y(end)-TargetY));
 fprintf('Final yaw err: %.4f\n', abs(wrapToPiLocal(TargetYaw - PSI(end))));
+fprintf('Final phase: %s\n', PHASE_NAME(end));
 
 %% =========================
 % Plot trajectory
 % =========================
-figure('Name','Hand-Scripted Parallel Parking Validation');
+figure('Name','State-Based Scripted Parallel Parking');
 hold on; grid on; axis equal;
 
 drawCar(RearCarCenter, 0, ParkedCarLength, ParkedCarWidth, [0.7 0.7 0.7]);
@@ -223,12 +282,12 @@ rectangle('Position',[-SlotLength/2 CurbY SlotLength SlotDepth], ...
 
 xlabel('X (m)');
 ylabel('Y (m)');
-title('Hand-Scripted Parallel Parking Validation');
+title('State-Based Scripted Parallel Parking');
 
 %% =========================
-% Plot states and controls
+% Plot states and commands
 % =========================
-figure('Name','States and Commands');
+figure('Name','State-Based States and Commands');
 
 subplot(4,1,1);
 plot(V, 'LineWidth', 1.5); grid on;
@@ -251,13 +310,13 @@ xlabel('Step');
 %% =========================
 % Animation
 % =========================
-figure('Name','Hand-Scripted Parking Animation');
+figure('Name','State-Based Parking Animation');
 hold on; grid on; axis equal;
 xlim([Geofence(1), Geofence(2)]);
 ylim([Geofence(3), Geofence(4)]);
 xlabel('X (m)');
 ylabel('Y (m)');
-title('Hand-Scripted Parking Animation');
+title('State-Based Parking Animation');
 
 drawCar(RearCarCenter, 0, ParkedCarLength, ParkedCarWidth, [0.7 0.7 0.7]);
 drawCar(FrontCarCenter, 0, ParkedCarLength, ParkedCarWidth, [0.7 0.7 0.7]);

@@ -4,16 +4,10 @@ clear; clc; close all;
 %% =========================
 % State-Based Scripted Parallel Parking Baseline
 % =========================
-% Key update in this version:
-%   - Adds an EARLY STOP GATE so the car stops once it is "good enough"
-%     instead of continuing to over-park.
-%
-% Phase sequence:
-%   1) forward_approach
-%   2) reverse_turn_in
-%   3) reverse_straighten
-%   4) reverse_heading_correction
-%   5) stop
+% Patched version:
+%   - uses rotated-rectangle collision helpers
+%   - collision now matches the rotated car geometry
+%   - no AABB collision for ego vehicle
 
 %% =========================
 % Parameters
@@ -60,7 +54,7 @@ GoalRadius = 0.10;
 GoalYawTol = deg2rad(25);
 GoalSpeedTol = 0.06;
 
-% Early stop gate (so it stops before over-parking)
+% Early stop gate
 softStopPosTol = 0.2;
 softStopYawTol = deg2rad(20);
 
@@ -76,8 +70,8 @@ delta = 0.0;
 %% =========================
 % Phase parameters
 % =========================
-entryX = 0.7;                  % forward until x reaches this
-reverseTurnYawTarget = -0.55;   % switch from turn-in to straighten
+entryX = 0.7;
+reverseTurnYawTarget = -0.55;
 headingCorrectionTol = deg2rad(1.5);
 
 % Commands by phase
@@ -85,7 +79,6 @@ steer_approach   =  0.00;  vref_approach  =  0.12;
 steer_turnin     = -0.30;  vref_turnin    = -0.12;
 steer_straight   =  0.90;  vref_straight  = -0.08;
 
-% Small final correction commands
 steer_correct_l  = -0.12;
 steer_correct_r  =  0.18;
 vref_correct     = -0.02;
@@ -110,6 +103,16 @@ success = false;
 collision = false;
 outOfBounds = false;
 
+% collision debug flags
+hitFront = false;
+hitRear  = false;
+hitCurb  = false;
+
+% final polygons for optional debug drawing
+finalEgoPoly = [];
+finalFrontPoly = [];
+finalRearPoly = [];
+
 %% =========================
 % Simulation loop
 % =========================
@@ -119,9 +122,7 @@ for k = 1:MaxSteps
     yawErrSigned = wrapToPiLocal(TargetYaw - psi);
     yawErr = abs(yawErrSigned);
 
-    % ----- Early stop gate -----
-    % Once the car is already in a decent parking pose, stop motion
-    % so it does not keep over-parking.
+    % Early stop gate
     if posErr < softStopPosTol && yawErr < softStopYawTol
         phase = "stop";
     end
@@ -167,7 +168,6 @@ for k = 1:MaxSteps
             vRef = vref_straight;
 
         case "reverse_heading_correction"
-            % Small final touch-up based on heading error sign
             if yawErrSigned > headingCorrectionTol
                 steerCmd = steer_correct_l;
             elseif yawErrSigned < -headingCorrectionTol
@@ -186,7 +186,6 @@ for k = 1:MaxSteps
     steerCmd = min(max(steerCmd, SteerMin), SteerMax);
 
     % Speed controller
-    % Stronger braking once stop is triggered
     if phase == "stop"
         vCmd = 2.5 * (vRef - v);
     else
@@ -205,14 +204,11 @@ for k = 1:MaxSteps
     y = y + Ts * v * sin(psi);
     psi = wrapToPiLocal(psi + Ts * (v/Wheelbase) * tan(delta));
 
-    % Checks
-    egoBox = getEgoAABB(x, y, EgoLength, EgoWidth);
-    frontBox = getRectAABB(FrontCarCenter, ParkedCarLength, ParkedCarWidth);
-    rearBox  = getRectAABB(RearCarCenter,  ParkedCarLength, ParkedCarWidth);
-
-    collision = aabbOverlap(egoBox, frontBox) || ...
-                aabbOverlap(egoBox, rearBox) || ...
-                (egoBox(3) < CurbY);
+    % ===== Patched collision check using rotated geometry =====
+    [collision, hitFront, hitRear, hitCurb, egoPoly, frontPoly, rearPoly] = ...
+        checkParkingCollision([x, y], psi, EgoLength, EgoWidth, ...
+                              FrontCarCenter, RearCarCenter, ...
+                              ParkedCarLength, ParkedCarWidth, CurbY);
 
     outOfBounds = (x < Geofence(1)) || (x > Geofence(2)) || ...
                   (y < Geofence(3)) || (y > Geofence(4));
@@ -242,6 +238,10 @@ for k = 1:MaxSteps
         STEER_CMD = STEER_CMD(1:k);
         VREF = VREF(1:k);
         PHASE_NAME = PHASE_NAME(1:k);
+
+        finalEgoPoly = egoPoly;
+        finalFrontPoly = frontPoly;
+        finalRearPoly = rearPoly;
         break;
     end
 end
@@ -261,6 +261,9 @@ fprintf('Final speed: %.4f m/s\n', V(end));
 fprintf('Final pos err: %.4f\n', hypot(X(end)-TargetX, Y(end)-TargetY));
 fprintf('Final yaw err: %.4f\n', abs(wrapToPiLocal(TargetYaw - PSI(end))));
 fprintf('Final phase: %s\n', PHASE_NAME(end));
+fprintf('hitFront: %d\n', hitFront);
+fprintf('hitRear : %d\n', hitRear);
+fprintf('hitCurb : %d\n', hitCurb);
 
 %% =========================
 % Plot trajectory
@@ -279,6 +282,13 @@ plot(X(end), Y(end), 'ro', 'MarkerSize', 10, 'LineWidth', 2);
 plot([Geofence(1), Geofence(2)], [CurbY, CurbY], 'k--', 'LineWidth', 1.5);
 rectangle('Position',[-SlotLength/2 CurbY SlotLength SlotDepth], ...
     'EdgeColor',[0 0.5 0], 'LineStyle','--', 'LineWidth',1.5);
+
+% Optional final collision polygon drawing
+if ~isempty(finalEgoPoly)
+    drawPoly(finalEgoPoly, [1 0 0], '--');      % red
+    drawPoly(finalFrontPoly, [1 1 0], '--');    % yellow
+    drawPoly(finalRearPoly, [1 1 0], '--');     % yellow
+end
 
 xlabel('X (m)');
 ylabel('Y (m)');
@@ -331,8 +341,9 @@ hCar = patch(nan, nan, [0.2 0.4 1.0], 'FaceAlpha', 0.5);
 
 for k = 1:length(X)
     set(hTrail, 'XData', X(1:k), 'YData', Y(1:k));
-    [px, py] = carPolygon([X(k), Y(k)], PSI(k), EgoLength, EgoWidth);
-    set(hCar, 'XData', px, 'YData', py);
+    poly = carPolygon([X(k), Y(k)], PSI(k), EgoLength, EgoWidth);
+    p = [poly; poly(1,:)];
+    set(hCar, 'XData', p(:,1), 'YData', p(:,2));
     drawnow;
     pause(0.03);
 end
@@ -340,42 +351,10 @@ end
 %% =========================
 % Local functions
 % =========================
-function box = getEgoAABB(x, y, L, W)
-    halfL = L/2;
-    halfW = W/2;
-    box = [x-halfL, x+halfL, y-halfW, y+halfW];
-end
-
-function box = getRectAABB(center, L, W)
-    halfL = L/2;
-    halfW = W/2;
-    box = [center(1)-halfL, center(1)+halfL, center(2)-halfW, center(2)+halfW];
-end
-
-function tf = aabbOverlap(a, b)
-    tf = (a(1) <= b(2)) && (a(2) >= b(1)) && ...
-         (a(3) <= b(4)) && (a(4) >= b(3));
-end
-
 function drawCar(center, yaw, L, W, colorVal)
-    [px, py] = carPolygon(center, yaw, L, W);
-    patch(px, py, colorVal, 'FaceAlpha', 0.4, 'EdgeColor', 'k');
-end
-
-function [px, py] = carPolygon(center, yaw, L, W)
-    c = cos(yaw);
-    s = sin(yaw);
-    R = [c -s; s c];
-
-    corners = [ L/2,  W/2;
-                L/2, -W/2;
-               -L/2, -W/2;
-               -L/2,  W/2]';
-
-    worldCorners = R * corners + center(:);
-
-    px = [worldCorners(1,:), worldCorners(1,1)];
-    py = [worldCorners(2,:), worldCorners(2,1)];
+    poly = carPolygon(center, yaw, L, W);
+    p = [poly; poly(1,:)];
+    patch(p(:,1), p(:,2), colorVal, 'FaceAlpha', 0.4, 'EdgeColor', 'k');
 end
 
 function a = wrapToPiLocal(a)
